@@ -6,7 +6,6 @@ Usage:
     python run_all_benchmarks.py --all          # Run everything
     python run_all_benchmarks.py --benchmarks   # Only benchmarks
     python run_all_benchmarks.py --tests        # Only failure tests
-    python run_all_benchmarks.py --viz          # Only visualizations
     python run_all_benchmarks.py --report       # Only report generation
 """
 
@@ -24,8 +23,8 @@ def run_recovery_benchmark():
     print("\n" + "=" * 60)
     print("Running Recovery Time Benchmark")
     print("=" * 60)
-    from benchmark_recovery_time import run_simplified_benchmark
-    return run_simplified_benchmark()
+    from benchmark_recovery_time import main
+    return main()
 
 
 def run_checkpoint_benchmark():
@@ -80,7 +79,7 @@ def main():
         description="Run distributed training orchestrator benchmarks"
     )
     parser.add_argument('--all', action='store_true',
-                       help='Run all benchmarks, tests, visualizations, and report')
+                       help='Run all benchmarks, tests, and report')
     parser.add_argument('--benchmarks', action='store_true',
                        help='Run only performance benchmarks')
     parser.add_argument('--tests', action='store_true',

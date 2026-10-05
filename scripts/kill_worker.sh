@@ -29,7 +29,7 @@ WORKER_PID=${WORKER_PIDS[$WORKER_INDEX]}
 if kill -0 "$WORKER_PID" 2>/dev/null; then
     echo "Killing worker $WORKER_INDEX (PID: $WORKER_PID)..."
     kill -9 "$WORKER_PID"
-    echo "Worker killed. Master should detect failure within 15 seconds."
+    echo "Worker killed. Master should detect failure within 15-20 seconds."
     echo ""
     echo "After master detects failure, run: ./scripts/restart_workers.sh"
 else

@@ -3,6 +3,7 @@ import orchestrator_pb2
 import grpc
 import orchestrator_pb2_grpc
 from concurrent import futures
+import os
 import time
 import json
 import threading
@@ -42,6 +43,7 @@ class OrchestratorServicerMaster(OrchestratorServicer):
                 'current_loss': 0.0,
                 'is_training': False,
                 'last_heartbeat': time.time(),
+                'last_checkpoint_signal': 0,
             }
 
             print(f"Worker {worker_id} registered with rank {assigned_rank}")
@@ -67,7 +69,7 @@ class OrchestratorServicerMaster(OrchestratorServicer):
                 self.workers[worker_id]['is_training'] = request.is_training
                 self.workers[worker_id]['last_heartbeat'] = time.time()
 
-            if request.checkpointed_iteration > 0:
+            if worker_id in self.workers and request.checkpointed_iteration > 0:
                 iteration = request.checkpointed_iteration
                 if iteration not in self.checkpoint_completion:
                     self.checkpoint_completion[iteration] = set()
@@ -85,30 +87,33 @@ class OrchestratorServicerMaster(OrchestratorServicer):
 
             self.display_dashboard()
 
-            should_checkpoint = self.check_checkpoint_condition()
+            should_checkpoint = self.check_checkpoint_condition(worker_id)
 
             return orchestrator_pb2.HeartbeatResponse(
                 acknowledged=True,
                 should_checkpoint=should_checkpoint
             )
 
-    def check_checkpoint_condition(self):
-        if len(self.workers) < self.expected_workers:
+    def check_checkpoint_condition(self, worker_id):
+        if worker_id not in self.workers or len(self.workers) < self.expected_workers:
             return False
 
-        iterations = [w['current_iteration'] for w in self.workers.values()]
-        min_iteration = min(iterations) if iterations else 0
+        # DDP keeps workers in lockstep, so each worker is signalled on its own
+        # heartbeat for the checkpoint iteration (exactly once per iteration).
+        info = self.workers[worker_id]
+        iteration = info['current_iteration']
 
-        if min_iteration == 0:
+        if iteration == 0 or iteration % self.checkpoint_interval != 0:
             return False
 
-        if (min_iteration % self.checkpoint_interval == 0 and
-            min_iteration > self.last_checkpoint_iteration):
-            self.last_checkpoint_iteration = min_iteration
-            print(f"\n*** CHECKPOINT TRIGGERED at iteration {min_iteration} ***\n")
-            return True
+        if iteration <= info['last_checkpoint_signal']:
+            return False
 
-        return False
+        info['last_checkpoint_signal'] = iteration
+        if iteration > self.last_checkpoint_iteration:
+            self.last_checkpoint_iteration = iteration
+            print(f"\n*** CHECKPOINT TRIGGERED at iteration {iteration} ***\n")
+        return True
 
     def CanStartTraining(self, request, context):
         with self.lock:
@@ -147,18 +152,19 @@ class OrchestratorServicerMaster(OrchestratorServicer):
         print(f"Saved orchestrator state to /tmp/orchestrator_state.json")
 
     def trigger_recovery(self):
-        with self.lock:
-            if self.in_recovery:
-                return
-            
-            print("!!! Failure Detected - Triggering Recovery !!!")
-            self.in_recovery = True
+        # Caller must hold self.lock (it is not reentrant).
+        print("!!! Failure Detected - Triggering Recovery !!!")
+        self.in_recovery = True
 
-            # Reset worker state to force re-registration
-            self.workers = {}
-            self.next_rank = 0
-            
-            print("Workers killed. Please run ./run.sh to restart")
+        # Reset worker state to force re-registration
+        self.workers = {}
+        self.next_rank = 0
+
+        # Drop partial checkpoints; training resumes from the last complete one
+        self.checkpoint_completion = {}
+        self.last_checkpoint_iteration = self.last_complete_checkpoint
+
+        print("Run ./scripts/restart_workers.sh to restart workers from the last checkpoint")
 
     def failure_detector_thread(self):
         while True:
@@ -172,7 +178,10 @@ class OrchestratorServicerMaster(OrchestratorServicer):
                         break # Only trigger once per check
     
 def serve():
-    servicer = OrchestratorServicerMaster()
+    servicer = OrchestratorServicerMaster(
+        expected_workers=int(os.environ.get('EXPECTED_WORKERS', 4)),
+        checkpoint_interval=int(os.environ.get('CHECKPOINT_INTERVAL', 10)),
+    )
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     orchestrator_pb2_grpc.add_OrchestratorServicer_to_server(servicer, server)
     server.add_insecure_port('[::]:50051')

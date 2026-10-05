@@ -6,8 +6,9 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 SRC_DIR="$PROJECT_ROOT/src"
 PID_FILE="$PROJECT_ROOT/.pids"
 
-# Activate virtual environment
-source "$PROJECT_ROOT/.venv/bin/activate"
+# Activate conda environment
+eval "$(conda shell.bash hook)" 2>/dev/null
+conda activate myproject 2>/dev/null
 
 # Clean up any existing checkpoints and state for fresh start
 rm -rf /tmp/checkpoints

@@ -1,10 +1,12 @@
 """Utility functions for benchmarking distributed training orchestrator."""
 
 import os
+import re
 import sys
 import json
 import time
 import signal
+import tempfile
 import subprocess
 from pathlib import Path
 from datetime import datetime
@@ -24,117 +26,149 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class ProcessManager:
-    """Manages master and worker processes for benchmarking."""
+    """Manages master and worker processes for benchmarking.
 
-    def __init__(self, num_workers: int = 4, checkpoint_interval: int = 10):
+    Process output goes to per-process log files (never a pipe: the master
+    prints a dashboard on every heartbeat and would block on a full pipe).
+    Timings are taken by polling those logs.
+    """
+
+    POLL_INTERVAL = 0.02
+
+    def __init__(self, num_workers: int = 4, checkpoint_interval: int = 10,
+                 num_iterations: int = 100):
         self.num_workers = num_workers
         self.checkpoint_interval = checkpoint_interval
+        self.num_iterations = num_iterations
         self.master_process: Optional[subprocess.Popen] = None
         self.worker_processes: List[subprocess.Popen] = []
-        self.master_pid: Optional[int] = None
-        self.worker_pids: List[int] = []
+        self.log_dir = Path(tempfile.mkdtemp(prefix="orchestrator_bench_"))
+        self.master_log = self.log_dir / "master.log"
+        self.worker_logs: List[Path] = []
+        self.generation = 0
+        self._log_files = []
 
-    def start_master(self, extra_args: List[str] = None) -> int:
-        """Start the master process and return its PID."""
-        cmd = [sys.executable, str(SRC_DIR / "master.py")]
-        if extra_args:
-            cmd.extend(extra_args)
+    def _spawn(self, script: str, log_path: Path) -> subprocess.Popen:
+        env = os.environ.copy()
+        env["EXPECTED_WORKERS"] = str(self.num_workers)
+        env["CHECKPOINT_INTERVAL"] = str(self.checkpoint_interval)
+        env["NUM_ITERATIONS"] = str(self.num_iterations)
+        env["PYTHONUNBUFFERED"] = "1"
 
-        self.master_process = subprocess.Popen(
-            cmd,
+        log_file = open(log_path, "w")
+        self._log_files.append(log_file)
+        return subprocess.Popen(
+            [sys.executable, str(SRC_DIR / script)],
             cwd=str(SRC_DIR),
-            stdout=subprocess.PIPE,
+            env=env,
+            stdout=log_file,
             stderr=subprocess.STDOUT,
-            text=True
         )
-        self.master_pid = self.master_process.pid
-        time.sleep(2)  # Wait for master to start
-        return self.master_pid
 
-    def start_workers(self, num_workers: Optional[int] = None) -> List[int]:
-        """Start worker processes and return their PIDs."""
-        num = num_workers or self.num_workers
+    def start_master(self) -> int:
+        """Start the master process and return its PID."""
+        self.master_process = self._spawn("master.py", self.master_log)
+        if self.wait_for_log([self.master_log], "Orchestrator server started", timeout=30) is None:
+            raise RuntimeError(f"Master failed to start, see {self.master_log}")
+        return self.master_process.pid
+
+    def start_workers(self) -> List[int]:
+        """Start a fresh generation of worker processes and return their PIDs."""
+        self.generation += 1
         self.worker_processes = []
-        self.worker_pids = []
+        self.worker_logs = []
 
-        for _ in range(num):
-            proc = subprocess.Popen(
-                [sys.executable, str(SRC_DIR / "worker.py")],
-                cwd=str(SRC_DIR),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True
-            )
-            self.worker_processes.append(proc)
-            self.worker_pids.append(proc.pid)
+        for i in range(self.num_workers):
+            log_path = self.log_dir / f"worker_gen{self.generation}_{i}.log"
+            self.worker_logs.append(log_path)
+            self.worker_processes.append(self._spawn("worker.py", log_path))
             time.sleep(0.5)
 
-        return self.worker_pids
+        return [p.pid for p in self.worker_processes]
 
     def kill_worker(self, index: int = 0) -> Tuple[int, float]:
         """Kill a specific worker and return (PID, timestamp)."""
         if index >= len(self.worker_processes):
             raise ValueError(f"Worker index {index} out of range")
 
-        pid = self.worker_pids[index]
+        pid = self.worker_processes[index].pid
         kill_time = time.time()
         os.kill(pid, signal.SIGKILL)
         return pid, kill_time
 
-    def kill_all_workers(self) -> float:
-        """Kill all workers and return timestamp."""
-        kill_time = time.time()
+    def kill_all_workers(self):
+        """Kill all workers and wait for them to exit."""
         for proc in self.worker_processes:
             try:
                 proc.kill()
-            except ProcessLookupError:
-                pass
-        self.worker_processes = []
-        self.worker_pids = []
-        return kill_time
-
-    def stop_all(self):
-        """Stop all processes gracefully."""
-        for proc in self.worker_processes:
-            try:
-                proc.terminate()
                 proc.wait(timeout=5)
             except (ProcessLookupError, subprocess.TimeoutExpired):
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
+                pass
+        self.worker_processes = []
+
+    def stop_all(self):
+        """Stop all processes."""
+        self.kill_all_workers()
 
         if self.master_process:
             try:
-                self.master_process.terminate()
+                self.master_process.kill()
                 self.master_process.wait(timeout=5)
             except (ProcessLookupError, subprocess.TimeoutExpired):
-                try:
-                    self.master_process.kill()
-                except ProcessLookupError:
-                    pass
-
-        self.worker_processes = []
-        self.worker_pids = []
+                pass
         self.master_process = None
-        self.master_pid = None
 
-    def is_master_running(self) -> bool:
-        """Check if master is still running."""
-        if self.master_process is None:
-            return False
-        return self.master_process.poll() is None
+        for log_file in self._log_files:
+            log_file.close()
+        self._log_files = []
+
+    def wait_for_log(self, log_paths: List[Path], pattern: str,
+                     timeout: float = 120, after: int = 0) -> Optional[float]:
+        """Wait until `pattern` appears in every log; return the timestamp, or None on timeout.
+
+        `after` skips that many leading characters (used for the master log,
+        which spans several worker generations).
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if all(pattern in read_log(path)[after:] for path in log_paths):
+                return time.time()
+            time.sleep(self.POLL_INTERVAL)
+        return None
 
     def wait_for_completion(self, timeout: float = 300) -> bool:
-        """Wait for all processes to complete."""
-        start = time.time()
-        while time.time() - start < timeout:
-            all_done = all(p.poll() is not None for p in self.worker_processes)
-            if all_done:
-                return True
-            time.sleep(1)
-        return False
+        """Wait for workers to exit; True only if every worker finished training."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if all(p.poll() is not None for p in self.worker_processes):
+                break
+            time.sleep(self.POLL_INTERVAL)
+        return all("Training completed!" in read_log(path) for path in self.worker_logs)
+
+    def master_log_size(self) -> int:
+        return len(read_log(self.master_log))
+
+    def last_complete_checkpoint(self) -> int:
+        """Last iteration the master reported as checkpointed by all workers."""
+        matches = re.findall(r"All workers completed checkpoint for iteration (\d+)",
+                             read_log(self.master_log))
+        return int(matches[-1]) if matches else 0
+
+    def loaded_checkpoints(self) -> List[Optional[int]]:
+        """Checkpoint iteration each current worker resumed from (None if it did not)."""
+        loaded = []
+        for path in self.worker_logs:
+            match = re.search(r"Loaded checkpoint from iteration (\d+)", read_log(path))
+            loaded.append(int(match.group(1)) if match else None)
+        return loaded
+
+
+def read_log(path: Path) -> str:
+    """Read a log file, returning '' if it does not exist yet."""
+    try:
+        return Path(path).read_text(errors="replace")
+    except FileNotFoundError:
+        return ""
 
 
 class BenchmarkTimer:

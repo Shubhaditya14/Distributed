@@ -198,7 +198,10 @@ class Worker:
                 print("Master is in recovery mode. Attempting to load checkpoint.")
                 start_iteration = self.load_checkpoint(recovery_info.checkpoint_iteration)
 
-            self.train(num_iterations=100, start_iteration=start_iteration)
+            self.train(
+                num_iterations=int(os.environ.get('NUM_ITERATIONS', 100)),
+                start_iteration=start_iteration
+            )
         except Exception as e:
             print(f"Error during training: {e}")
         finally:
